@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <TinyGPSPlus.h>
 #include "protocol.h"
@@ -21,17 +22,18 @@
 // Pin kontrol E220  (SESUAIKAN dengan wiring kamu)
 #define LORA_M0  32     // ESP32 -> M0
 #define LORA_M1  33     // ESP32 -> M1
-#define LORA_AUX 25     // E220 AUX -> ESP32 (input)
+#define LORA_AUX 19     // E220 AUX -> ESP32 (input)
 
 // LED indikator
 #define LED_PIN 23
 
 // ==================================================
-// WIFI ACCESS POINT
+// WIFI (STATION -> SAMBUNG KE HOTSPOT)
 // ==================================================
 
-#define AP_SSID     "Lora Testing"
-#define AP_PASSWORD ""            // kosong = AP terbuka, minimal 8 karakter kalau mau dipassword
+#define WIFI_SSID     "12345678"
+#define WIFI_PASSWORD ""            // kosong = hotspot tanpa password
+#define MDNS_NAME     "eepisat"     // alamat alternatif: http://eepisat.local
 
 // ==================================================
 // TIMING
@@ -44,6 +46,7 @@ const unsigned long HANDSHAKE_INTERVAL = 2000;   // jeda kirim "start"
 const uint8_t       HS_TRIES_BEFORE_HW = 10;     // gagal handshake sekian kali -> cek hardware lagi
 const unsigned long HW_RETRY_INTERVAL  = 3000;   // jeda ulang cek hardware kalau gagal
 const unsigned long LED_BLINK_MS       = 250;
+const unsigned long WIFI_RETRY_MS      = 10000;  // jeda ulang sambung ke hotspot kalau belum terhubung
 
 // ==================================================
 // OBJECT
@@ -88,6 +91,8 @@ uint16_t remoteRxCount = 0;
 
 // ==================================================
 // HALAMAN WEB (disimpan di flash)
+// Peta: Leaflet + OpenStreetMap, dimuat dari internet oleh browser
+// (HP/laptop yang membuka halaman ini harus punya internet dari hotspot)
 // ==================================================
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -111,22 +116,34 @@ h2{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em
 .v{font-size:19px;font-weight:600;margin-top:2px;overflow-wrap:anywhere}
 .badge{display:inline-block;margin-top:4px;padding:3px 10px;border-radius:99px;color:#fff;font-size:13px;font-weight:600;background:var(--mut)}
 .ok{background:var(--ok)}.warn{background:var(--warn)}.bad{background:var(--bad)}
-a{color:inherit;font-size:13px}
 #err{display:none;margin-top:12px;color:var(--bad);font-size:13px}
+#mapwrap{position:relative;border:1px solid var(--bd);border-radius:10px;overflow:hidden;background:var(--card)}
+#map{height:55vh;min-height:280px}
+#mapmsg{display:none;position:absolute;left:50%;top:10px;transform:translateX(-50%);z-index:1000;max-width:90%;padding:5px 12px;border-radius:99px;background:rgba(17,24,39,.88);color:#fff;font-size:12px;text-align:center;pointer-events:none}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+button{font:inherit;font-size:13px;padding:6px 12px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--tx);cursor:pointer}
+button.on{background:var(--ok);border-color:var(--ok);color:#fff}
 </style>
 </head>
 <body>
 <h1>EEPISAT Telemetry</h1>
-<div class="sub">AP: Lora Testing &middot; <span id="up">-</span></div>
+<div class="sub">WiFi: <span id="ssid">-</span> &middot; IP <span id="ip">-</span> &middot; <span id="up">-</span></div>
 
 <div class="grid">
   <div class="card"><div class="k">LoRa link</div><span id="lora" class="badge">-</span><div class="k" id="hw" style="margin-top:6px"></div></div>
   <div class="card"><div class="k">GPS</div><span id="gps" class="badge">-</span></div>
 </div>
 
+<h2>Peta Live</h2>
+<div id="mapwrap"><div id="map"></div><div id="mapmsg"></div></div>
+<div class="bar">
+  <button id="bFollow" class="on">Ikuti posisi: ON</button>
+  <button id="bCenter">Pusatkan</button>
+  <button id="bClear">Hapus jejak</button>
+</div>
+
 <h2>Posisi</h2>
 <div class="grid" id="pos"></div>
-<p><a id="map" href="#" target="_blank" style="display:none">Buka di Google Maps (butuh internet di HP)</a></p>
 
 <h2>Link LoRa</h2>
 <div class="grid" id="lnk"></div>
@@ -135,12 +152,63 @@ a{color:inherit;font-size:13px}
 
 <script>
 const POS=[['lat','Latitude'],['lon','Longitude'],['alt','Altitude (m)'],['spd','Kecepatan (km/h)'],['sats','Satelit'],['hdop','HDOP'],['crs','Arah (&deg;)'],['utc','Waktu UTC']];
-const LNK=[['sent','Paket terkirim'],['acked','ACK diterima'],['lost','ACK hilang'],['loss','Packet loss'],['rtt','RTT'],['ackago','ACK terakhir'],['rxc','Diterima RX'],['miss','Missed ACK'],['sta','Client AP']];
+const LNK=[['sent','Paket terkirim'],['acked','ACK diterima'],['lost','ACK hilang'],['loss','Packet loss'],['rtt','RTT'],['ackago','ACK terakhir'],['rxc','Diterima RX'],['miss','Missed ACK'],['rssi','Sinyal WiFi']];
 const $=id=>document.getElementById(id);
 function build(id,a){$(id).innerHTML=a.map(x=>'<div class="card"><div class="k">'+x[1]+'</div><div class="v" id="f_'+x[0]+'">-</div></div>').join('');}
 build('pos',POS);build('lnk',LNK);
 const put=(k,v)=>{$('f_'+k).textContent=(v===null||v===undefined||v==='')?'-':v;};
 function badge(id,t,c){const e=$(id);e.textContent=t;e.className='badge '+c;}
+
+/* ---------------- PETA (Leaflet) ---------------- */
+const LF='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
+const MAXPTS=1000;
+let map=null,marker=null,trail=null,pts=[],lastLL=null,follow=true,firstFix=true,cssAdded=false;
+
+function mapMsg(t){const e=$('mapmsg');if(t){e.textContent=t;e.style.display='block';}else{e.style.display='none';}}
+function setFollow(v){follow=v;const b=$('bFollow');b.textContent='Ikuti posisi: '+(v?'ON':'OFF');b.className=v?'on':'';}
+
+function initMap(){
+  const osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'});
+  const sat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Tiles &copy; Esri'});
+  map=L.map('map',{layers:[osm]}).setView([-2.5,118],5);
+  L.control.layers({'Peta':osm,'Satelit':sat}).addTo(map);
+  trail=L.polyline([],{color:'#2563eb',weight:3,opacity:.85}).addTo(map);
+  marker=L.circleMarker([0,0],{radius:9,color:'#fff',weight:3,fillColor:'#dc2626',fillOpacity:1});
+  map.on('dragstart',()=>setFollow(false));
+  updateMap();
+}
+
+function updateMap(){
+  if(!map)return;
+  if(!lastLL){mapMsg('Menunggu fix GPS...');return;}
+  mapMsg('');
+  marker.setLatLng(lastLL);
+  if(!map.hasLayer(marker))marker.addTo(map);
+  trail.setLatLngs(pts);
+  if(firstFix){map.setView(lastLL,17);firstFix=false;}
+  else if(follow){map.panTo(lastLL);}
+}
+
+function loadMap(){
+  mapMsg('Memuat peta...');
+  if(!cssAdded){
+    const c=document.createElement('link');
+    c.rel='stylesheet';c.href=LF+'leaflet.min.css';
+    c.onload=()=>{if(map)map.invalidateSize();};
+    document.head.appendChild(c);cssAdded=true;
+  }
+  const s=document.createElement('script');
+  s.src=LF+'leaflet.min.js';
+  s.onload=initMap;
+  s.onerror=()=>{s.remove();mapMsg('Peta gagal dimuat (HP/laptop butuh internet dari hotspot). Mencoba lagi...');setTimeout(loadMap,10000);};
+  document.head.appendChild(s);
+}
+
+$('bFollow').onclick=()=>{setFollow(!follow);if(follow&&map&&lastLL)map.panTo(lastLL);};
+$('bCenter').onclick=()=>{if(map&&lastLL){map.setView(lastLL,Math.max(map.getZoom(),16));setFollow(true);}};
+$('bClear').onclick=()=>{pts=lastLL?[lastLL]:[];if(trail)trail.setLatLngs(pts);};
+
+/* ---------------- DATA TELEMETRI ---------------- */
 async function tick(){
   try{
     const d=await (await fetch('/data',{cache:'no-store'})).json();
@@ -154,17 +222,27 @@ async function tick(){
     put('lat',d.lat);put('lon',d.lon);put('alt',d.alt);put('spd',d.spd);
     put('sats',d.sats);put('hdop',d.hdop);put('crs',d.crs);
     put('utc',(d.date&&d.time)?d.date+' '+d.time:d.time);
-    const mp=$('map');
-    if(d.fix){mp.href='https://maps.google.com/?q='+d.lat+','+d.lon;mp.style.display='';}else{mp.style.display='none';}
+
+    // posisi -> peta
+    lastLL=(d.fix&&d.lat!==null&&d.lon!==null)?[d.lat,d.lon]:null;
+    if(lastLL){
+      const p=pts[pts.length-1];
+      if(!p||p[0]!==lastLL[0]||p[1]!==lastLL[1]){pts.push(lastLL);if(pts.length>MAXPTS)pts.shift();}
+    }
+    updateMap();
+
     put('sent',d.sent);put('acked',d.acked);put('lost',d.lost);
     const tot=d.acked+d.lost;
     put('loss',tot?(d.lost*100/tot).toFixed(1)+' %':null);
     put('rtt',(d.state==='CONNECTED'&&d.rtt>0)?d.rtt+' ms':null);
     put('ackago',d.ackago>=0?(d.ackago/1000).toFixed(1)+' s lalu':null);
-    put('rxc',d.rxc);put('miss',d.miss+' / '+d.maxmiss);put('sta',d.sta);
+    put('rxc',d.rxc);put('miss',d.miss+' / '+d.maxmiss);
+    put('rssi',d.rssi?d.rssi+' dBm':null);
+    $('ssid').textContent=d.ssid;$('ip').textContent=d.ip;
     $('up').textContent='uptime '+d.up+' s';
   }catch(e){$('err').style.display='block';}
 }
+loadMap();
 tick();setInterval(tick,1000);
 </script>
 </body>
@@ -238,6 +316,50 @@ const char* stateText() {
         case ST_HW_CHECK:  return "HW_CHECK";
         case ST_HANDSHAKE: return "HANDSHAKE";
         default:           return "CONNECTED";
+    }
+}
+
+// ==================================================
+// WIFI STATION : SAMBUNG KE HOTSPOT
+// ==================================================
+
+void wifiBegin() {
+    // password kosong -> hotspot terbuka (tanpa password)
+    WiFi.begin(WIFI_SSID, strlen(WIFI_PASSWORD) ? WIFI_PASSWORD : nullptr);
+}
+
+// Dipanggil terus-menerus dari loop(): lapor status + sambung ulang otomatis
+void wifiService() {
+
+    static wl_status_t   lastSt  = WL_NO_SHIELD;
+    static unsigned long lastTry = 0;
+
+    wl_status_t st = WiFi.status();
+
+    if (st != lastSt) {
+        lastSt = st;
+
+        if (st == WL_CONNECTED) {
+            Serial.printf("[WiFi] Terhubung ke \"%s\"  RSSI=%d dBm\n", WIFI_SSID, WiFi.RSSI());
+            Serial.print("[WiFi] Buka web : http://");
+            Serial.println(WiFi.localIP());
+
+            MDNS.end();
+            if (MDNS.begin(MDNS_NAME)) {
+                MDNS.addService("http", "tcp", 80);
+                Serial.printf("[WiFi] atau     : http://%s.local\n", MDNS_NAME);
+            }
+        } else {
+            Serial.printf("[WiFi] Tidak terhubung (status %d)\n", (int)st);
+            lastTry = millis();       // beri waktu auto-reconnect bawaan dulu
+        }
+    }
+
+    if (st != WL_CONNECTED && (millis() - lastTry) >= WIFI_RETRY_MS) {
+        lastTry = millis();
+        Serial.printf("[WiFi] Menyambung ke hotspot \"%s\"...\n", WIFI_SSID);
+        WiFi.disconnect();
+        wifiBegin();
     }
 }
 
@@ -452,7 +574,7 @@ void handleData() {
     unsigned long now = millis();
 
     String j;
-    j.reserve(700);
+    j.reserve(800);
     j += '{';
 
     kv(j, "state",  stateText(), true);
@@ -477,7 +599,9 @@ void handleData() {
     kv(j, "rxc",     String((unsigned long)remoteRxCount));
     kv(j, "miss",    String((unsigned long)missedAcks));
     kv(j, "maxmiss", String((unsigned long)MAX_MISSED_ACK));
-    kv(j, "sta",     String((unsigned long)WiFi.softAPgetStationNum()));
+    kv(j, "ssid",    WIFI_SSID, true);
+    kv(j, "ip",      WiFi.localIP().toString(), true);
+    kv(j, "rssi",    String(WiFi.RSSI()));
     kv(j, "up",      String(now / 1000));
 
     j += '}';
@@ -518,19 +642,23 @@ void setup() {
     Serial.println("EEPISAT GPS TELEMETRY");
     Serial.println("================================");
 
-    // WiFi Access Point + web server
-    WiFi.mode(WIFI_AP);
-    if (strlen(AP_PASSWORD) >= 8) WiFi.softAP(AP_SSID, AP_PASSWORD);
-    else                          WiFi.softAP(AP_SSID);
+    // WiFi Station: sambung ke hotspot + web server
+    WiFi.persistent(false);
+    WiFi.setHostname(MDNS_NAME);            // nama perangkat yang tampil di daftar hotspot
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);                   // matikan modem sleep supaya web responsif
+    WiFi.setAutoReconnect(true);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    WiFi.setMinSecurity(WIFI_AUTH_OPEN);    // core 3.x defaultnya menolak hotspot tanpa password
+#endif
+    wifiBegin();
 
     server.on("/", handleRoot);
     server.on("/data", handleData);
     server.begin();
 
-    Serial.print("AP  : ");
-    Serial.println(AP_SSID);
-    Serial.print("Web : http://");
-    Serial.println(WiFi.softAPIP());
+    Serial.printf("Hotspot : %s (tanpa password)\n", WIFI_SSID);
+    Serial.println("Alamat web akan muncul setelah ESP32 terhubung ke hotspot");
     Serial.println("Memulai cek modul LoRa...");
 
     lastHwTry = millis() - HW_RETRY_INTERVAL;     // cek hardware langsung di loop pertama
@@ -543,6 +671,7 @@ void setup() {
 void loop() {
 
     background();
+    wifiService();
     handleLoraRx();
 
     unsigned long now = millis();
